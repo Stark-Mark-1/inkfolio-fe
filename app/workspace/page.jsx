@@ -1,8 +1,19 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import AuthModal from "@/components/AuthModal";
 import MinimalLayout from "@/components/MinimalLayout";
+import {
+  ApiError,
+  getAuthMe,
+  getGeneration,
+  getGenerationStatus,
+  getPortfolioThemes,
+  getStoredAuthToken,
+  listGenerations,
+  resolvePublicPortfolio,
+  retryGeneration,
+} from "@/lib/backend";
 import { focusRing } from "@/lib/ui";
 
 const STAGE_UPLOAD = "upload";
@@ -11,104 +22,227 @@ const STAGE_RESULTS = "results";
 
 const TAB_RESUME_EDITOR = "resume-editor";
 const TAB_PORTFOLIO_BUILDER = "portfolio-builder";
-const MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024;
+
+const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024;
+const POLL_INTERVAL_MS = 2500;
+const POLL_TIMEOUT_MS = 75000;
 
 const ACCEPTED_MIME_TYPES = new Set([
   "application/pdf",
   "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "text/plain",
 ]);
-
-const ACCEPTED_EXTENSIONS = new Set(["pdf", "docx"]);
+const ACCEPTED_EXTENSIONS = new Set(["pdf", "docx", "txt"]);
 
 export default function WorkspacePage() {
   const fileInputRef = useRef(null);
   const [stage, setStage] = useState(STAGE_UPLOAD);
   const [activeTab, setActiveTab] = useState(TAB_RESUME_EDITOR);
-  const [theme, setTheme] = useState("minimal");
-  const [isAuthenticated] = useState(false);
-  const [isDragging, setIsDragging] = useState(false);
-  const [remainingToday, setRemainingToday] = useState(null);
+  const [theme, setTheme] = useState("minimal-clean");
+  const [themeOptions, setThemeOptions] = useState([]);
+  const [token, setToken] = useState("");
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
+  const [statusMessage, setStatusMessage] = useState("");
   const [improvedHtml, setImprovedHtml] = useState("");
-  const [structuredJson, setStructuredJson] = useState(null);
-  const hasResultData = improvedHtml.length > 0 || structuredJson !== null;
+  const [generation, setGeneration] = useState(null);
+  const [historyItems, setHistoryItems] = useState([]);
+  const [nextCursor, setNextCursor] = useState("");
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [retrying, setRetrying] = useState(false);
+  const [resolvingSlug, setResolvingSlug] = useState("");
+  const [showAuthModal, setShowAuthModal] = useState(false);
+
+  const requestToken = isAuthenticated ? token : undefined;
+  const hasPortfolioSlug = Boolean(generation?.portfolio?.slug);
+
+  useEffect(() => {
+    setToken(getStoredAuthToken());
+  }, []);
 
   useEffect(() => {
     const controller = new AbortController();
-
-    const fetchUsage = async () => {
+    const run = async () => {
       try {
-        const response = await fetch("/api/usage", {
-          method: "GET",
-          signal: controller.signal,
-        });
-
-        if (!response.ok) {
-          throw new Error("Failed usage fetch");
+        const { payload } = await getPortfolioThemes(controller.signal);
+        const themes = Array.isArray(payload?.themes) ? payload.themes : [];
+        setThemeOptions(themes);
+        if (themes.length && !themes.some((item) => item.id === theme)) {
+          setTheme(themes[0].id);
         }
+      } catch {}
+    };
+    void run();
+    return () => controller.abort();
+  }, [theme]);
 
-        const payload = await response.json();
-        const remaining = Number(payload?.remaining_today);
-
-        setRemainingToday(Number.isFinite(remaining) ? Math.max(0, remaining) : 0);
-      } catch (error) {
-        if (controller.signal.aborted) return;
-        setErrorMessage("Unable to load usage right now. Please try again.");
+  useEffect(() => {
+    const controller = new AbortController();
+    const run = async () => {
+      if (!token) {
+        setIsAuthenticated(false);
+        return;
+      }
+      try {
+        await getAuthMe({ token, signal: controller.signal });
+        setIsAuthenticated(true);
+      } catch {
+        setIsAuthenticated(false);
       }
     };
-
-    fetchUsage();
-
+    void run();
     return () => controller.abort();
-  }, []);
+  }, [token]);
+
+  useEffect(() => {
+    if (!requestToken) {
+      setHistoryItems([]);
+      setNextCursor("");
+      return;
+    }
+    void loadHistory({ token: requestToken, setHistoryItems, setNextCursor, setHistoryLoading });
+  }, [requestToken]);
+
+  const sessionLabel = useMemo(
+    () => (isAuthenticated ? "Logged-in session" : "Anonymous session"),
+    [isAuthenticated]
+  );
 
   const processSelectedFile = async (file) => {
     if (!file) return;
 
-    setIsDragging(false);
     setErrorMessage("");
-
-    if (remainingToday === 0) {
-      return;
-    }
+    setStatusMessage("");
 
     if (file.size > MAX_FILE_SIZE_BYTES) {
-      setErrorMessage("File size exceeds 5MB. Please upload a smaller file.");
+      setErrorMessage("File size exceeds 10MB.");
       return;
     }
 
     if (!isSupportedFile(file)) {
-      setErrorMessage("Only PDF or DOCX files are supported.");
+      setErrorMessage("Only PDF, DOCX, or TXT files are supported.");
       return;
     }
 
-    const formData = new FormData();
-    formData.append("file", file);
-
     setStage(STAGE_PROCESSING);
+    setStatusMessage("Uploading resume...");
+    setImprovedHtml("");
+    setGeneration(null);
 
     try {
-      const response = await fetch("/api/improve", {
+      const improveFormData = new FormData();
+      improveFormData.set("file", file, file.name || "resume.pdf");
+      improveFormData.set("theme", theme);
+      improveFormData.set("color", "#1e3a8a");
+
+      const headers = new Headers();
+      if (requestToken) {
+        const bearerValue = requestToken.startsWith("Bearer ")
+          ? requestToken
+          : `Bearer ${requestToken}`;
+        headers.set("authorization", bearerValue);
+      }
+      headers.set("idempotency-key", createClientIdempotencyKey("gen"));
+
+      setStatusMessage("Generating portfolio...");
+
+      const improveResponse = await fetch("/api/improve", {
         method: "POST",
-        body: formData,
+        headers,
+        body: improveFormData,
+        credentials: "include",
       });
 
-      if (!response.ok) {
-        throw new Error("Failed improve request");
+      if (!improveResponse.ok) {
+        throw await createProxyError(improveResponse);
       }
 
-      const payload = await response.json();
-      setImprovedHtml(payload?.improved_html ?? "");
-      setStructuredJson(payload?.structured_json ?? null);
+      const improvePayload = await improveResponse.json();
 
-      if (typeof remainingToday === "number") {
-        setRemainingToday(Math.max(0, remainingToday - 1));
+      let next = improvePayload;
+      if (next?.status === "PENDING" && next?.generationId && requestToken) {
+        next = (await pollGeneration(next.generationId, requestToken)) || next;
       }
 
+      await hydrateGeneration(next, requestToken, setGeneration, setImprovedHtml);
       setStage(STAGE_RESULTS);
+      setStatusMessage(next?.status === "PENDING" ? "Still pending." : "");
+
+      if (requestToken) {
+        await loadHistory({ token: requestToken, setHistoryItems, setNextCursor, setHistoryLoading });
+      }
     } catch (error) {
       setStage(STAGE_UPLOAD);
-      setErrorMessage("Unable to improve resume right now. Please try again.");
+      setStatusMessage("");
+      setErrorMessage(getFriendlyErrorMessage(error, "Unable to process resume."));
+    }
+  };
+
+  const handleRetry = async () => {
+    if (!generation?.generationId || retrying) return;
+
+    setRetrying(true);
+    setStage(STAGE_PROCESSING);
+    setStatusMessage("Retrying generation...");
+    setErrorMessage("");
+
+    try {
+      const retry = await retryGeneration({
+        generationId: generation.generationId,
+        token: requestToken,
+      });
+
+      let next = retry.payload;
+      if (next?.status === "PENDING" && next?.generationId) {
+        next = (await pollGeneration(next.generationId, requestToken)) || next;
+      }
+
+      await hydrateGeneration(next, requestToken, setGeneration, setImprovedHtml);
+      setStage(STAGE_RESULTS);
+      setStatusMessage("");
+    } catch (error) {
+      setStage(STAGE_RESULTS);
+      setStatusMessage("");
+      setErrorMessage(getFriendlyErrorMessage(error, "Unable to retry generation."));
+    } finally {
+      setRetrying(false);
+    }
+  };
+
+  const handleOpenPortfolio = async (slug) => {
+    if (!slug || resolvingSlug === slug) return;
+    setResolvingSlug(slug);
+    try {
+      const { payload } = await resolvePublicPortfolio({ slug });
+      if (payload?.url) {
+        window.open(payload.url, "_blank", "noopener,noreferrer");
+      } else {
+        throw new Error("Portfolio URL not found");
+      }
+    } catch (error) {
+      setErrorMessage(getFriendlyErrorMessage(error, "Unable to open portfolio URL."));
+    } finally {
+      setResolvingSlug("");
+    }
+  };
+
+  const handleLoadGeneration = async (generationId) => {
+    if (!generationId) return;
+    setStage(STAGE_PROCESSING);
+    setStatusMessage("Loading generation...");
+    setErrorMessage("");
+    try {
+      let { payload } = await getGeneration({ generationId, token: requestToken });
+      if (payload?.status === "PENDING") {
+        payload = (await pollGeneration(generationId, requestToken)) || payload;
+      }
+      await hydrateGeneration(payload, requestToken, setGeneration, setImprovedHtml);
+      setStage(STAGE_RESULTS);
+      setStatusMessage("");
+    } catch (error) {
+      setStage(STAGE_RESULTS);
+      setStatusMessage("");
+      setErrorMessage(getFriendlyErrorMessage(error, "Unable to load generation."));
     }
   };
 
@@ -118,357 +252,165 @@ export default function WorkspacePage() {
     event.target.value = "";
   };
 
-  const handleDragOver = (event) => {
-    event.preventDefault();
-    if (remainingToday === 0) return;
-    setIsDragging(true);
-  };
-
-  const handleDragLeave = (event) => {
-    event.preventDefault();
-    setIsDragging(false);
-  };
-
-  const handleDrop = (event) => {
-    event.preventDefault();
-    if (remainingToday === 0) {
-      setIsDragging(false);
-      return;
-    }
-    const file = event.dataTransfer.files?.[0];
-    void processSelectedFile(file);
-  };
-
   return (
     <MinimalLayout>
       <main className="min-h-screen py-8 sm:py-10">
         <section className="w-full max-w-[820px]">
-          <p className="text-xs font-medium uppercase tracking-[0.08em] text-[#555555]">
-            Resume
-          </p>
+          <div className="mb-2 flex items-center justify-between gap-3">
+            <p className="text-xs font-medium uppercase tracking-[0.08em] text-[#555555]">Resume</p>
+            <p className="text-xs text-[#555555]">{sessionLabel}</p>
+          </div>
 
           <div className="mt-3 border-t border-[#E5E5E5] pt-5">
-            {stage === STAGE_RESULTS ? (
-              <ResultsSection
-                activeTab={activeTab}
-                hasResultData={hasResultData}
-                improvedHtml={improvedHtml}
-                isAuthenticated={isAuthenticated}
-                setTheme={setTheme}
-                theme={theme}
-                onTabChange={setActiveTab}
+            {stage !== STAGE_RESULTS ? (
+              <UploadSection
+                fileInputRef={fileInputRef}
+                stage={stage}
+                statusMessage={statusMessage}
+                errorMessage={errorMessage}
+                onFileInputChange={handleFileInputChange}
+                onSelectFile={() => fileInputRef.current?.click()}
               />
             ) : (
-              <UploadProcessingSection
-                fileInputRef={fileInputRef}
-                isDragging={isDragging}
-                remainingToday={remainingToday}
-                errorMessage={errorMessage}
-                stage={stage}
-                onDragLeave={handleDragLeave}
-                onDragOver={handleDragOver}
-                onDrop={handleDrop}
-                onFileInputChange={handleFileInputChange}
+              <ResultsSection
+                activeTab={activeTab}
+                generation={generation}
+                improvedHtml={improvedHtml}
+                isAuthenticated={isAuthenticated}
+                isResolvingPortfolio={Boolean(resolvingSlug)}
+                isRetrying={retrying}
+                nextCursor={nextCursor}
+                onLoadGeneration={handleLoadGeneration}
+                onLoadMoreHistory={() =>
+                  loadHistory({
+                    token: requestToken,
+                    cursor: nextCursor,
+                    append: true,
+                    setHistoryItems,
+                    setNextCursor,
+                    setHistoryLoading,
+                  })
+                }
+                onOpenPortfolio={handleOpenPortfolio}
+                onOpenSignIn={() => setShowAuthModal(true)}
+                onRetry={handleRetry}
+                onTabChange={setActiveTab}
+                setTheme={setTheme}
+                theme={theme}
+                themeOptions={themeOptions}
+                historyItems={historyItems}
+                historyLoading={historyLoading}
+                hasPortfolioSlug={hasPortfolioSlug}
+                statusMessage={statusMessage}
               />
             )}
           </div>
+
+          {stage === STAGE_RESULTS && errorMessage && (
+            <p className="mt-3 text-xs text-[#555555]">{errorMessage}</p>
+          )}
         </section>
       </main>
+
+      <AuthModal
+        open={showAuthModal}
+        onClose={() => setShowAuthModal(false)}
+        variant="signin"
+        onContinueGuest={() => setShowAuthModal(false)}
+        onSignIn={() => {}}
+      />
     </MinimalLayout>
   );
 }
 
-function UploadProcessingSection({
+function UploadSection({
   fileInputRef,
-  remainingToday,
-  errorMessage,
-  isDragging,
   stage,
-  onDragLeave,
-  onDragOver,
-  onDrop,
+  statusMessage,
+  errorMessage,
   onFileInputChange,
+  onSelectFile,
 }) {
-  const isUploadStage = stage === STAGE_UPLOAD;
-  const isLimitReached = remainingToday === 0;
-  const remainingText = typeof remainingToday === "number" ? remainingToday : "--";
-
   return (
     <div>
-      <div className="flex items-center justify-between gap-4">
-        <p className="text-xs font-medium uppercase tracking-[0.08em] text-[#555555]">
-          Upload
-        </p>
-        <p className="text-xs text-[#555555]">{remainingText} generations remaining today</p>
-      </div>
-
-      <div
-        onDragOver={isUploadStage && !isLimitReached ? onDragOver : undefined}
-        onDragLeave={isUploadStage && !isLimitReached ? onDragLeave : undefined}
-        onDrop={isUploadStage && !isLimitReached ? onDrop : undefined}
-        className={`mt-3 border border-dashed px-5 py-8 ${
-          isUploadStage && isDragging
-            ? "border-[#1E3A8A] bg-[#EEE5CB]"
-            : "border-[#D7D0BD] bg-[#EFE7CF]"
-        }`}
-      >
-        {isUploadStage ? (
+      <p className="text-xs font-medium uppercase tracking-[0.08em] text-[#555555]">Upload</p>
+      <div className="mt-3 border border-dashed border-[#D7D0BD] bg-[#EFE7CF] px-5 py-8">
+        {stage === STAGE_UPLOAD ? (
           <>
-            <p className="text-base font-medium text-[#111111]">Drag and drop your resume</p>
-            <p className="mt-1 text-sm text-[#555555]">PDF or DOCX &bull; Max 5MB</p>
+            <p className="text-base font-medium text-[#111111]">Upload your resume</p>
+            <p className="mt-1 text-sm text-[#555555]">PDF, DOCX, or TXT • Max 10MB</p>
             <button
               type="button"
-              onClick={() => fileInputRef.current?.click()}
-              disabled={isLimitReached}
-              className={`mt-4 inline-flex items-center border border-[#CFC7B2] bg-[#F1E9D2] px-3 py-2 text-sm font-medium text-[#111111] transition-colors hover:bg-[#EBE1C5] disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:bg-[#F1E9D2] ${focusRing}`}
+              onClick={onSelectFile}
+              className={`mt-4 inline-flex items-center border border-[#CFC7B2] bg-[#F1E9D2] px-3 py-2 text-sm font-medium text-[#111111] transition-colors hover:bg-[#EBE1C5] ${focusRing}`}
             >
               Choose file
             </button>
             <input
               ref={fileInputRef}
               type="file"
-              accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+              accept=".pdf,.docx,.txt,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain"
               onChange={onFileInputChange}
               className="sr-only"
-              disabled={isLimitReached}
             />
           </>
         ) : (
           <p className="inline-flex items-center gap-1 text-sm text-[#555555]">
-            <span>Improving your resume</span>
+            <span>{statusMessage || "Processing"}</span>
             <AnimatedDots />
           </p>
         )}
       </div>
-
-      {isUploadStage && isLimitReached && (
-        <p className="mt-2 text-xs text-[#555555]">
-          Daily generation limit reached. Try again tomorrow.
-        </p>
-      )}
-
-      {isUploadStage && errorMessage && <p className="mt-2 text-xs text-[#555555]">{errorMessage}</p>}
+      {errorMessage && <p className="mt-2 text-xs text-[#555555]">{errorMessage}</p>}
     </div>
   );
 }
 
 function ResultsSection({
   activeTab,
-  hasResultData,
+  generation,
   improvedHtml,
   isAuthenticated,
+  isResolvingPortfolio,
+  isRetrying,
+  nextCursor,
+  onLoadGeneration,
+  onLoadMoreHistory,
+  onOpenPortfolio,
+  onOpenSignIn,
+  onRetry,
+  onTabChange,
   setTheme,
   theme,
-  onTabChange,
+  themeOptions,
+  historyItems,
+  historyLoading,
+  hasPortfolioSlug,
+  statusMessage,
 }) {
   const [editedHtml, setEditedHtml] = useState(improvedHtml);
-  const [exportError, setExportError] = useState("");
-  const [deployError, setDeployError] = useState("");
-  const [deployProcessing, setDeployProcessing] = useState(false);
-  const [deploySuccess, setDeploySuccess] = useState(false);
-  const [deployedUrl, setDeployedUrl] = useState("");
-  const [isCopied, setIsCopied] = useState(false);
-  const [authModalOpen, setAuthModalOpen] = useState(false);
-  const [authModalVariant, setAuthModalVariant] = useState("predeploy");
-  const deployInFlightRef = useRef(false);
-  const copyResetTimeoutRef = useRef(null);
-  const hasResumeContent = improvedHtml.trim().length > 0;
 
   useEffect(() => {
     setEditedHtml(improvedHtml);
   }, [improvedHtml]);
 
-  useEffect(() => {
-    setDeployedUrl("");
-    setDeployError("");
-    setDeploySuccess(false);
-    setIsCopied(false);
-  }, [editedHtml]);
-
-  useEffect(() => {
-    return () => {
-      if (copyResetTimeoutRef.current) {
-        window.clearTimeout(copyResetTimeoutRef.current);
-      }
-    };
-  }, []);
-
-  const handleDownloadHtml = () => {
-    const titleText = getFirstHeadingText(editedHtml);
-    const slug = slugify(titleText);
-    const fileName = slug ? `${slug}-resume.html` : "resume.html";
-
-    const htmlString = `<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8" />
-<title>Resume</title>
-<style>
-body { font-family: Arial, Helvetica, sans-serif; margin: 40px auto; max-width: 800px; line-height: 1.5; color: #000; }
-h1 { font-size: 24px; margin-bottom: 6px; }
-h2 { font-size: 14px; margin-top: 18px; border-bottom: 1px solid #000; padding-bottom: 4px; }
-p { margin: 6px 0; }
-ul { margin: 6px 0 6px 18px; }
-li { margin-bottom: 4px; }
-a { color: #000; text-decoration: none; }
-</style>
-</head>
-<body>
-${editedHtml}
-</body>
-</html>`;
-
-    const blob = new Blob([htmlString], { type: "text/html" });
-    const downloadUrl = URL.createObjectURL(blob);
+  const exportHtml = () => {
+    const blob = new Blob([editedHtml], { type: "text/html" });
+    const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
-    link.href = downloadUrl;
-    link.download = fileName;
+    link.href = url;
+    link.download = "resume.html";
     document.body.appendChild(link);
     link.click();
     link.remove();
-    URL.revokeObjectURL(downloadUrl);
-  };
-
-  const handleExportCode = async () => {
-    try {
-      setExportError("");
-
-      const titleText = getFirstHeadingText(editedHtml);
-      const portfolioTitle = titleText ? `${titleText} - Portfolio` : "Portfolio";
-      const slug = slugify(titleText);
-      const zipName = slug ? `${slug}-portfolio.zip` : "portfolio.zip";
-      const JSZip = (await import("jszip")).default;
-
-      const indexHtml = `<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>${portfolioTitle}</title>
-<link rel="stylesheet" href="style.css" />
-</head>
-<body>
-<div class="container">
-${editedHtml}
-</div>
-</body>
-</html>`;
-
-      const styleCss = getThemeCss(theme);
-
-      const zip = new JSZip();
-      zip.file("index.html", indexHtml);
-      zip.file("style.css", styleCss);
-
-      const blob = await zip.generateAsync({ type: "blob" });
-      const downloadUrl = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = downloadUrl;
-      link.download = zipName;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      URL.revokeObjectURL(downloadUrl);
-    } catch (error) {
-      setExportError("Unable to export portfolio code right now. Please try again.");
-    }
-  };
-
-  const deployPortfolio = async () => {
-    if (deployInFlightRef.current) return;
-
-    try {
-      deployInFlightRef.current = true;
-      setAuthModalOpen(false);
-      setDeployError("");
-      setIsCopied(false);
-      setDeployedUrl("");
-      setDeploySuccess(false);
-      setDeployProcessing(true);
-
-      const response = await fetch("/api/deploy", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          html: editedHtml,
-          theme: theme,
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error("Failed deploy request");
-      }
-
-      const payload = await response.json();
-      const deployedUrlValue = payload?.deployed_url;
-
-      if (typeof deployedUrlValue !== "string" || !deployedUrlValue) {
-        throw new Error("Missing deployed url");
-      }
-
-      setDeployedUrl(deployedUrlValue);
-      setDeploySuccess(true);
-    } catch (error) {
-      setDeployError("Unable to deploy portfolio right now. Please try again.");
-      setDeploySuccess(false);
-    } finally {
-      setDeployProcessing(false);
-      deployInFlightRef.current = false;
-    }
-  };
-
-  const handleDeploy = () => {
-    if (deployProcessing) return;
-
-    if (!isAuthenticated) {
-      setAuthModalVariant("predeploy");
-      setAuthModalOpen(true);
-      return;
-    }
-
-    void deployPortfolio();
-  };
-
-  const handlePredeploySignIn = () => {
-    setAuthModalVariant("signin");
-  };
-
-  const handleContinueAsGuest = () => {
-    void deployPortfolio();
-  };
-
-  const handleCopyLink = async () => {
-    if (!deployedUrl) return;
-
-    try {
-      await navigator.clipboard.writeText(deployedUrl);
-      setIsCopied(true);
-      if (copyResetTimeoutRef.current) {
-        window.clearTimeout(copyResetTimeoutRef.current);
-      }
-      copyResetTimeoutRef.current = window.setTimeout(() => {
-        setIsCopied(false);
-      }, 2000);
-    } catch (error) {
-      setIsCopied(false);
-    }
-  };
-
-  const handleOpenLink = () => {
-    if (!deployedUrl) return;
-    window.open(deployedUrl, "_blank", "noopener,noreferrer");
+    URL.revokeObjectURL(url);
   };
 
   return (
     <div>
       <div className="border-b border-[#E5E5E5]">
         <div className="-mb-px flex items-end gap-6">
-          <TabButton
-            isActive={activeTab === TAB_RESUME_EDITOR}
-            onClick={() => onTabChange(TAB_RESUME_EDITOR)}
-          >
+          <TabButton isActive={activeTab === TAB_RESUME_EDITOR} onClick={() => onTabChange(TAB_RESUME_EDITOR)}>
             Resume Editor
           </TabButton>
           <TabButton
@@ -480,215 +422,124 @@ ${editedHtml}
         </div>
       </div>
 
-      <div
-        className="mx-auto mt-6 max-w-[820px] border border-[#E5E5E5] bg-white px-10 py-12"
-        data-result-ready={hasResultData ? "true" : "false"}
-      >
+      <div className="mx-auto mt-6 max-w-[820px] border border-[#E5E5E5] bg-white px-8 py-10">
         {activeTab === TAB_RESUME_EDITOR ? (
           <>
-            <p className="text-xs font-medium uppercase tracking-[0.08em] text-[#555555]">
-              Editor
-            </p>
-            <div className="mt-3 border-t border-[#E5E5E5] pt-6">
-              <div
-                contentEditable
-                suppressContentEditableWarning
-                dangerouslySetInnerHTML={{ __html: editedHtml }}
-                onPaste={(event) => {
-                  event.preventDefault();
-
-                  const text = event.clipboardData.getData("text/plain");
-                  document.execCommand("insertText", false, text);
-                }}
-                onInput={(event) => {
-                  const clean = event.currentTarget.innerHTML
-                    .replace(/ style="[^"]*"/g, "")
-                    .replace(/ class="[^"]*"/g, "");
-
-                  setEditedHtml(clean);
-                }}
-                className={`min-h-[260px] text-[#111111] focus-visible:outline-none ${focusRing}`}
-              />
-            </div>
-
-            <div className="mt-8 border-t border-[#E5E5E5] pt-5">
-              <div className="flex flex-wrap items-center gap-3">
-                <button
-                  type="button"
-                  onClick={handleDownloadHtml}
-                  className={`inline-flex items-center rounded-md bg-[#1E3A8A] px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-[#1C347C] ${focusRing}`}
-                >
-                  Download HTML
-                </button>
-                <button
-                  type="button"
-                  className={`inline-flex items-center rounded-md border border-[#E5E5E5] px-4 py-2 text-sm font-medium text-[#111111] transition-colors hover:bg-[#F7F4EC] ${focusRing}`}
-                >
-                  Export PDF
-                </button>
-                <button
-                  type="button"
-                  onClick={() => onTabChange(TAB_PORTFOLIO_BUILDER)}
-                  className={`inline-flex items-center rounded-md border border-[#E5E5E5] px-4 py-2 text-sm font-medium text-[#111111] transition-colors hover:bg-[#F7F4EC] ${focusRing}`}
-                >
-                  Generate Portfolio
-                </button>
-              </div>
-            </div>
+            <div
+              contentEditable
+              suppressContentEditableWarning
+              dangerouslySetInnerHTML={{ __html: editedHtml }}
+              onInput={(event) => setEditedHtml(event.currentTarget.innerHTML)}
+              className={`min-h-[260px] text-[#111111] focus-visible:outline-none ${focusRing}`}
+            />
+            <button
+              type="button"
+              onClick={exportHtml}
+              className={`mt-6 inline-flex items-center rounded-md bg-[#1E3A8A] px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-[#1C347C] ${focusRing}`}
+            >
+              Download HTML
+            </button>
           </>
         ) : (
           <>
-            <p className="text-xs font-medium uppercase tracking-[0.08em] text-[#555555]">
-              Portfolio
-            </p>
-            <div className="mt-3 border-t border-[#E5E5E5] pt-6">
-              <fieldset className="space-y-3">
-                <legend className="sr-only">Theme</legend>
-                <label className="flex items-center gap-2 text-sm text-[#111111]">
+            <fieldset className="space-y-2">
+              <legend className="text-xs font-medium uppercase tracking-[0.08em] text-[#555555]">Theme</legend>
+              {themeOptions.map((item) => (
+                <label key={item.id} className="flex items-center gap-2 text-sm text-[#111111]">
                   <input
-                    checked={theme === "minimal"}
+                    checked={theme === item.id}
                     className={focusRing}
-                    name="portfolio-theme"
-                    onChange={() => setTheme("minimal")}
+                    name="theme"
+                    onChange={() => setTheme(item.id)}
                     type="radio"
-                    value="minimal"
+                    value={item.id}
                   />
-                  <span>Minimal</span>
+                  <span>{item.name}</span>
                 </label>
-                <label className="flex items-center gap-2 text-sm text-[#111111]">
-                  <input
-                    checked={theme === "professional"}
-                    className={focusRing}
-                    name="portfolio-theme"
-                    onChange={() => setTheme("professional")}
-                    type="radio"
-                    value="professional"
-                  />
-                  <span>Professional</span>
-                </label>
-                <label className="flex items-center gap-2 text-sm text-[#111111]">
-                  <input
-                    checked={theme === "creative"}
-                    className={focusRing}
-                    name="portfolio-theme"
-                    onChange={() => setTheme("creative")}
-                    type="radio"
-                    value="creative"
-                  />
-                  <span>Creative</span>
-                </label>
-              </fieldset>
-            </div>
-
-            <div className="mt-8 border-t border-[#E5E5E5] pt-5">
-              <div className="flex flex-col items-start gap-3">
+              ))}
+            </fieldset>
+            <div className="mt-6 flex flex-wrap gap-2">
+              <button
+                type="button"
+                disabled={!hasPortfolioSlug || isResolvingPortfolio}
+                onClick={() => onOpenPortfolio(generation?.portfolio?.slug)}
+                className={`inline-flex items-center rounded-md bg-[#1E3A8A] px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-[#1C347C] disabled:cursor-not-allowed disabled:opacity-60 ${focusRing}`}
+              >
+                {isResolvingPortfolio ? "Resolving..." : "Open Live Portfolio"}
+              </button>
+              {generation?.status === "FAILED" && (
                 <button
                   type="button"
-                  disabled={deployProcessing || !hasResumeContent}
-                  onClick={handleExportCode}
-                  className={`inline-flex items-center rounded-md bg-[#1E3A8A] px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-[#1C347C] disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:bg-[#1E3A8A] ${focusRing}`}
+                  disabled={isRetrying}
+                  onClick={onRetry}
+                  className={`inline-flex items-center rounded-md border border-[#E5E5E5] px-4 py-2 text-sm text-[#111111] transition-colors hover:bg-[#F7F4EC] ${focusRing}`}
                 >
-                  Export Code
+                  {isRetrying ? "Retrying..." : "Retry"}
                 </button>
-                <button
-                  type="button"
-                  disabled={deployProcessing || !hasResumeContent}
-                  onClick={handleDeploy}
-                  className={`inline-flex items-center rounded-md bg-[#1E3A8A] px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-[#1C347C] disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:bg-[#1E3A8A] ${focusRing}`}
-                >
-                  Deploy Portfolio
-                </button>
-              </div>
+              )}
             </div>
-
-            {!hasResumeContent && (
-              <p className="mt-3 text-xs text-[#555555]">
-                Improve your resume first to generate a portfolio.
-              </p>
-            )}
-
-            {deployProcessing && (
-              <p className="mt-3 inline-flex items-center gap-1 text-xs text-[#555555]">
-                <span>Deploying portfolio</span>
-                <AnimatedDots />
-              </p>
-            )}
-
-            {exportError && <p className="mt-3 text-xs text-[#555555]">{exportError}</p>}
-            {deployError && <p className="mt-3 text-xs text-[#555555]">{deployError}</p>}
-
-            {deploySuccess && deployedUrl && (
-              <div className="mt-4 border border-[#E5E5E5] bg-white p-4">
-                <p className="text-sm text-[#555555]">Portfolio deployed successfully.</p>
-                <p className="mt-1 break-all text-sm text-[#555555]">{deployedUrl}</p>
-                <p className="mt-1 text-xs text-[#555555]">Deployed just now.</p>
-                <div className="mt-3 flex flex-wrap items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={handleCopyLink}
-                    className={`inline-flex items-center rounded-md border border-[#E5E5E5] px-3 py-1.5 text-sm text-[#111111] transition-colors hover:bg-[#F7F4EC] ${focusRing}`}
-                  >
-                    {isCopied ? "Copied" : "Copy Link"}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleOpenLink}
-                    className={`inline-flex items-center rounded-md border border-[#E5E5E5] px-3 py-1.5 text-sm text-[#111111] transition-colors hover:bg-[#F7F4EC] ${focusRing}`}
-                  >
-                    Open in new tab
-                  </button>
-                </div>
-              </div>
-            )}
+            {statusMessage && <p className="mt-3 text-xs text-[#555555]">{statusMessage}</p>}
           </>
         )}
       </div>
 
-      <AuthModal
-        open={authModalOpen}
-        onClose={() => {
-          setAuthModalOpen(false);
-          setAuthModalVariant("predeploy");
-        }}
-        variant={authModalVariant}
-        onContinueGuest={handleContinueAsGuest}
-        onSignIn={handlePredeploySignIn}
-      />
+      <div className="mx-auto mt-6 max-w-[820px] border border-[#E5E5E5] bg-white px-6 py-6">
+        <div className="mb-3 flex items-center justify-between gap-2">
+          <p className="text-xs font-medium uppercase tracking-[0.08em] text-[#555555]">Generation History</p>
+          {!isAuthenticated && (
+            <button
+              type="button"
+              onClick={onOpenSignIn}
+              className={`inline-flex items-center rounded-md border border-[#E5E5E5] px-3 py-1.5 text-xs text-[#111111] transition-colors hover:bg-[#F7F4EC] ${focusRing}`}
+            >
+              Sign in to load history
+            </button>
+          )}
+        </div>
+        {isAuthenticated ? (
+          <>
+            {historyItems.map((item) => (
+              <div key={item.generationId} className="mb-2 border border-[#E5E5E5] px-3 py-2">
+                <p className="text-xs text-[#555555]">
+                  {item.status} • {item.createdAt ? new Date(item.createdAt).toLocaleString() : "Unknown date"}
+                </p>
+                <div className="mt-2 flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={() => onLoadGeneration(item.generationId)}
+                    className={`inline-flex items-center rounded-md border border-[#E5E5E5] px-3 py-1.5 text-xs text-[#111111] transition-colors hover:bg-[#F7F4EC] ${focusRing}`}
+                  >
+                    Open
+                  </button>
+                  {item.portfolio?.slug && (
+                    <button
+                      type="button"
+                      onClick={() => onOpenPortfolio(item.portfolio.slug)}
+                      className={`inline-flex items-center rounded-md border border-[#E5E5E5] px-3 py-1.5 text-xs text-[#111111] transition-colors hover:bg-[#F7F4EC] ${focusRing}`}
+                    >
+                      View Portfolio
+                    </button>
+                  )}
+                </div>
+              </div>
+            ))}
+            {historyLoading && <p className="text-xs text-[#555555]">Loading history...</p>}
+            {nextCursor && !historyLoading && (
+              <button
+                type="button"
+                onClick={onLoadMoreHistory}
+                className={`mt-2 inline-flex items-center rounded-md border border-[#E5E5E5] px-3 py-1.5 text-xs text-[#111111] transition-colors hover:bg-[#F7F4EC] ${focusRing}`}
+              >
+                Load More
+              </button>
+            )}
+          </>
+        ) : (
+          <p className="text-xs text-[#555555]">`GET /v1/generations` requires a bearer token.</p>
+        )}
+      </div>
     </div>
   );
-}
-
-function getThemeCss(theme) {
-  if (theme === "professional") {
-    return `body { font-family: Arial, Helvetica, sans-serif; margin: 0; background: #F3F4F6; color: #111111; line-height: 1.55; }
-.container { max-width: 900px; margin: 36px auto; padding: 32px; background: #FFFFFF; }
-h1 { font-size: 30px; margin: 0 0 8px; font-weight: 700; }
-h2 { font-size: 14px; margin: 22px 0 10px; padding-bottom: 6px; border-bottom: 1px solid #D1D5DB; letter-spacing: 0.04em; text-transform: uppercase; }
-p { margin: 8px 0; }
-ul { margin: 8px 0 8px 20px; }
-li { margin-bottom: 5px; }
-a { color: #111111; text-decoration: none; }`;
-  }
-
-  if (theme === "creative") {
-    return `body { font-family: Arial, Helvetica, sans-serif; margin: 0; background: #F8F3E7; color: #111111; line-height: 1.6; }
-.container { max-width: 900px; margin: 40px auto; padding: 0 20px; }
-h1 { font-size: 34px; margin: 0 0 8px; color: #1E3A8A; }
-h2 { font-size: 20px; margin: 20px 0 10px; color: #1E3A8A; }
-p { margin: 8px 0; }
-ul { margin: 8px 0 8px 20px; }
-li { margin-bottom: 5px; }
-a { color: #1E3A8A; text-decoration: none; }`;
-  }
-
-  return `body { font-family: Arial, Helvetica, sans-serif; margin: 0; background: #FFFFFF; color: #000000; line-height: 1.5; }
-.container { max-width: 900px; margin: 40px auto; padding: 0 20px; }
-h1 { font-size: 30px; margin: 0 0 8px; }
-h2 { font-size: 18px; margin: 18px 0 8px; }
-p { margin: 6px 0; }
-ul { margin: 6px 0 6px 18px; }
-li { margin-bottom: 4px; }
-a { color: #000000; text-decoration: none; }`;
 }
 
 function TabButton({ children, isActive, onClick }) {
@@ -718,15 +569,12 @@ function AnimatedDots() {
           opacity: 0.15;
           animation: workspace-dot-fade 1.2s infinite;
         }
-
         .workspace-dot-delay-1 {
           animation-delay: 0.2s;
         }
-
         .workspace-dot-delay-2 {
           animation-delay: 0.4s;
         }
-
         @keyframes workspace-dot-fade {
           0%,
           80%,
@@ -742,28 +590,123 @@ function AnimatedDots() {
   );
 }
 
+async function hydrateGeneration(payload, token, setGeneration, setImprovedHtml) {
+  let next = payload;
+  if (next?.generationId && !next?.createdAt) {
+    try {
+      const detail = await getGeneration({ generationId: next.generationId, token });
+      next = { ...next, ...detail.payload };
+    } catch {}
+  }
+  setGeneration(next || null);
+
+  if (next?.resume?.htmlUrl) {
+    try {
+      const response = await fetch(next.resume.htmlUrl, { cache: "no-store" });
+      if (!response.ok) throw new Error("Resume preview load failed");
+      setImprovedHtml(await response.text());
+    } catch {
+      setImprovedHtml("");
+    }
+  }
+}
+
+async function pollGeneration(generationId, token) {
+  const started = Date.now();
+  let latest = null;
+  while (Date.now() - started < POLL_TIMEOUT_MS) {
+    await sleep(POLL_INTERVAL_MS);
+    const result = await getGenerationStatus({ generationId, token });
+    latest = result.payload;
+    if (latest?.status && latest.status !== "PENDING") {
+      return latest;
+    }
+  }
+  return latest;
+}
+
+async function loadHistory({
+  token,
+  cursor,
+  append = false,
+  setHistoryItems,
+  setNextCursor,
+  setHistoryLoading,
+}) {
+  if (!token) return;
+  setHistoryLoading(true);
+  try {
+    const result = await listGenerations({
+      token,
+      limit: 20,
+      cursor,
+    });
+    const items = Array.isArray(result?.payload?.items) ? result.payload.items : [];
+    setHistoryItems((prev) => (append ? [...prev, ...items] : items));
+    setNextCursor(result?.payload?.nextCursor || "");
+  } finally {
+    setHistoryLoading(false);
+  }
+}
+
 function isSupportedFile(file) {
   const fileName = file.name?.toLowerCase() ?? "";
   const extension = fileName.includes(".") ? fileName.split(".").pop() : "";
-
   return ACCEPTED_MIME_TYPES.has(file.type) || ACCEPTED_EXTENSIONS.has(extension);
 }
 
-function getFirstHeadingText(html) {
-  if (!html) return "";
-
-  const parser = new DOMParser();
-  const doc = parser.parseFromString(html, "text/html");
-  const firstHeading = doc.querySelector("h1");
-  return firstHeading?.textContent?.trim() || "";
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function slugify(value) {
-  if (!value) return "";
+function createClientIdempotencyKey(prefix = "gen") {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return `${prefix}-${crypto.randomUUID()}`;
+  }
 
-  return value
-    .toLowerCase()
-    .replace(/[^a-z0-9\s-]/g, "")
-    .trim()
-    .replace(/\s+/g, "-");
+  const random = Math.random().toString(36).slice(2, 10);
+  return `${prefix}-${Date.now()}-${random}`;
+}
+
+async function createProxyError(response) {
+  let message = `Request failed with status ${response.status}`;
+
+  try {
+    const payload = await response.json();
+    const backendMessage = payload?.error?.message;
+    const requestId = payload?.error?.requestId || response.headers.get("x-request-id");
+    if (backendMessage) {
+      message = backendMessage;
+    }
+    if (requestId) {
+      message = `${message} (Request ID: ${requestId})`;
+    }
+  } catch {
+    const text = await response.text().catch(() => "");
+    if (text) {
+      message = text;
+    }
+  }
+
+  return new Error(message);
+}
+
+function getFriendlyErrorMessage(error, fallbackMessage) {
+  if (error instanceof ApiError) {
+    const requestIdSuffix = error.requestId ? ` (Request ID: ${error.requestId})` : "";
+    switch (error.code) {
+      case "FILE_TOO_LARGE":
+        return `File size exceeds 10MB.${requestIdSuffix}`;
+      case "UNSUPPORTED_FILE_TYPE":
+        return `Only PDF, DOCX, or TXT files are supported.${requestIdSuffix}`;
+      case "GENERATE_COOLDOWN":
+        return `Please wait 5 seconds before generating again.${requestIdSuffix}`;
+      case "QUOTA_EXCEEDED":
+        return `Daily quota reached. Please try again tomorrow.${requestIdSuffix}`;
+      default:
+        return `${error.message || fallbackMessage}${requestIdSuffix}`;
+    }
+  }
+  if (error instanceof Error && error.message) return error.message;
+  return fallbackMessage;
 }

@@ -10,7 +10,7 @@ It provides a paper-style workspace to:
 
 ## Features
 
-- Resume upload with file validation (`PDF`/`DOCX`, max `5MB`)
+- Resume upload with file validation (`PDF`/`DOCX`/`TXT`, max `10MB`)
 - Usage-aware generation flow (`remaining_today`)
 - Inline editable resume HTML surface
 - Resume export (`.html`)
@@ -52,33 +52,51 @@ Open: `http://localhost:3000`
 - `/workspace` - resume + portfolio workspace
 - `/auth/signin` - sign-in page
 
-## API Contract (Expected by Frontend)
+## API Contract (Integrated)
 
-The UI expects these backend endpoints:
+Upload + generate are orchestrated through frontend API route:
 
-1. `GET /api/usage`
-```json
-{
-  "resume_count": 0,
-  "generations_today": 0,
-  "remaining_today": 5
-}
+1. `POST /api/improve` (frontend route)
+   - Accepts `multipart/form-data` with `file` (+ optional `theme`, `color`)
+   - Proxies to backend:
+     - `POST /v1/resume/upload`
+     - `POST /v1/generate` with `Idempotency-Key`
+   - Does **not** manually construct multipart boundaries.
+
+Other frontend calls target `inkfolio-be` directly (default: `http://localhost:3001`).
+Implemented backend endpoints:
+
+1. `GET /v1/portfolio/themes`
+2. `GET /v1/auth/me` (if JWT exists in local storage key `inkfolio_supabase_jwt`)
+3. `POST /v1/resume/upload`
+4. `POST /v1/generate` (with `Idempotency-Key`)
+5. `GET /v1/generations/:id/status` (polling for pending jobs)
+6. `GET /v1/generations/:id` (detail hydration)
+7. `POST /v1/generations/:id/retry`
+8. `GET /v1/generations` (logged-in history only)
+9. `GET /v1/public/portfolio/:slug` (live portfolio URL resolution)
+
+Behavior notes:
+
+- Anonymous mode is supported via cookie-backed session (`credentials: include`).
+- Logged-in mode is used automatically when a bearer token is present.
+- Upload supports `PDF`, `DOCX`, and `TXT` up to `10MB`.
+
+## Environment Variables
+
+Set backend URL in Vercel for reliable routing:
+
+```env
+BACKEND_URL=https://your-backend-domain
+NEXT_PUBLIC_BACKEND_URL=https://your-backend-domain
 ```
 
-2. `POST /api/improve` (multipart `FormData`, field: `file`)
-```json
-{
-  "improved_html": "<h1>Jane Doe</h1>",
-  "structured_json": {}
-}
-```
+Resolution order:
 
-3. `POST /api/deploy`
-```json
-{
-  "deployed_url": "https://example.com/portfolio"
-}
-```
+1. `BACKEND_URL` (server routes like `/api/improve`)
+2. `NEXT_PUBLIC_BACKEND_URL` (browser + server fallback)
+3. `NEXT_PUBLIC_API_BASE_URL` (legacy fallback)
+4. default `http://localhost:3001`
 
 ## Project Structure
 
