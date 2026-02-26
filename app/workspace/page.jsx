@@ -171,7 +171,8 @@ export default function WorkspacePage() {
       const { resumeUploadId } = uploadPayload;
 
       // Step 2 — Generate portfolio (§4.7)
-      setStatusMessage("Generating portfolio...");
+      // Generate runs synchronously and can take up to ~30 seconds.
+      setStatusMessage("Generating portfolio — this can take up to 30 seconds...");
       const idempotencyKey = makeIdempotencyKey("gen");
 
       const { payload: genPayload } = await createGeneration({
