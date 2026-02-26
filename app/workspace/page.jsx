@@ -1,209 +1,235 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import AuthModal from "@/components/AuthModal";
 import MinimalLayout from "@/components/MinimalLayout";
 import {
   ApiError,
+  createGeneration,
   getAuthMe,
   getGeneration,
   getGenerationStatus,
   getPortfolioThemes,
-  getStoredAuthToken,
   listGenerations,
+  makeIdempotencyKey,
   resolvePublicPortfolio,
   retryGeneration,
-} from "@/lib/backend";
+  uploadResume,
+} from "@/lib/api";
+import { supabase } from "@/lib/supabase";
 import { focusRing } from "@/lib/ui";
 
-const STAGE_UPLOAD = "upload";
-const STAGE_PROCESSING = "processing";
-const STAGE_RESULTS = "results";
+// ─── Constants ───────────────────────────────────────────────────────────────
 
-const TAB_RESUME_EDITOR = "resume-editor";
-const TAB_PORTFOLIO_BUILDER = "portfolio-builder";
-
-const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024;
+const MAX_FILE_BYTES = 10 * 1024 * 1024;
 const POLL_INTERVAL_MS = 2500;
 const POLL_TIMEOUT_MS = 75000;
+const DEFAULT_COLOR = "#2563eb";
 
-const ACCEPTED_MIME_TYPES = new Set([
+const ACCEPTED_MIME = new Set([
   "application/pdf",
   "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
   "text/plain",
 ]);
-const ACCEPTED_EXTENSIONS = new Set(["pdf", "docx", "txt"]);
+const ACCEPTED_EXT = new Set(["pdf", "docx", "txt"]);
+
+// ─── Main page ────────────────────────────────────────────────────────────────
 
 export default function WorkspacePage() {
   const fileInputRef = useRef(null);
-  const [stage, setStage] = useState(STAGE_UPLOAD);
-  const [activeTab, setActiveTab] = useState(TAB_RESUME_EDITOR);
-  const [theme, setTheme] = useState("minimal-clean");
-  const [themeOptions, setThemeOptions] = useState([]);
-  const [token, setToken] = useState("");
-  const [isAuthenticated, setIsAuthenticated] = useState(false);
-  const [errorMessage, setErrorMessage] = useState("");
+
+  // Auth
+  const [token, setToken] = useState(null); // null = not yet loaded
+  const [user, setUser] = useState(null);
+  const [authReady, setAuthReady] = useState(false);
+
+  // UI
+  const [stage, setStage] = useState("upload"); // "upload" | "processing" | "results"
   const [statusMessage, setStatusMessage] = useState("");
-  const [improvedHtml, setImprovedHtml] = useState("");
-  const [generation, setGeneration] = useState(null);
-  const [historyItems, setHistoryItems] = useState([]);
-  const [nextCursor, setNextCursor] = useState("");
-  const [historyLoading, setHistoryLoading] = useState(false);
-  const [retrying, setRetrying] = useState(false);
-  const [resolvingSlug, setResolvingSlug] = useState("");
+  const [errorMessage, setErrorMessage] = useState("");
   const [showAuthModal, setShowAuthModal] = useState(false);
 
+  // Themes
+  const [themeOptions, setThemeOptions] = useState([]);
+  const [theme, setTheme] = useState("minimal-clean");
+
+  // Active tab in results
+  const [activeTab, setActiveTab] = useState("resume");
+
+  // Generation
+  const [generation, setGeneration] = useState(null);
+  const [resumeHtml, setResumeHtml] = useState("");
+  const [editedHtml, setEditedHtml] = useState("");
+
+  // History
+  const [historyItems, setHistoryItems] = useState([]);
+  const [nextCursor, setNextCursor] = useState(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
+
+  // Action states
+  const [retrying, setRetrying] = useState(false);
+  const [resolvingSlug, setResolvingSlug] = useState("");
+
+  const isAuthenticated = !!user;
   const requestToken = isAuthenticated ? token : undefined;
-  const hasPortfolioSlug = Boolean(generation?.portfolio?.slug);
+
+  // ── 1. Supabase session bootstrap + auth state listener ──────────────────
 
   useEffect(() => {
-    setToken(getStoredAuthToken());
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setToken(session?.access_token ?? "");
+      setAuthReady(true);
+    });
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setToken(session?.access_token ?? "");
+      if (!session) setUser(null);
+    });
+
+    return () => subscription.unsubscribe();
   }, []);
 
+  // ── 2. Validate token with backend whenever it changes ───────────────────
+
+  useEffect(() => {
+    if (!authReady) return;
+    if (!token) {
+      setUser(null);
+      setHistoryItems([]);
+      setNextCursor(null);
+      return;
+    }
+
+    const controller = new AbortController();
+    getAuthMe({ token, signal: controller.signal })
+      .then(({ payload }) => setUser(payload.user))
+      .catch(() => setUser(null));
+
+    return () => controller.abort();
+  }, [token, authReady]);
+
+  // ── 3. Load history whenever auth state resolves ─────────────────────────
+
+  useEffect(() => {
+    if (!isAuthenticated || !requestToken) return;
+    void loadHistory({ token: requestToken, setHistoryItems, setNextCursor, setHistoryLoading });
+  }, [isAuthenticated, requestToken]);
+
+  // ── 4. Fetch themes on mount ──────────────────────────────────────────────
+
   useEffect(() => {
     const controller = new AbortController();
-    const run = async () => {
-      try {
-        const { payload } = await getPortfolioThemes(controller.signal);
+    getPortfolioThemes(controller.signal)
+      .then(({ payload }) => {
         const themes = Array.isArray(payload?.themes) ? payload.themes : [];
         setThemeOptions(themes);
-        if (themes.length && !themes.some((item) => item.id === theme)) {
+        if (themes.length && !themes.some((t) => t.id === theme)) {
           setTheme(themes[0].id);
         }
-      } catch {}
-    };
-    void run();
+      })
+      .catch(() => {});
     return () => controller.abort();
-  }, [theme]);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── 5. Keep editedHtml in sync with fetched resumeHtml ───────────────────
 
   useEffect(() => {
-    const controller = new AbortController();
-    const run = async () => {
-      if (!token) {
-        setIsAuthenticated(false);
-        return;
-      }
-      try {
-        await getAuthMe({ token, signal: controller.signal });
-        setIsAuthenticated(true);
-      } catch {
-        setIsAuthenticated(false);
-      }
-    };
-    void run();
-    return () => controller.abort();
-  }, [token]);
+    setEditedHtml(resumeHtml);
+  }, [resumeHtml]);
 
-  useEffect(() => {
-    if (!requestToken) {
-      setHistoryItems([]);
-      setNextCursor("");
-      return;
-    }
-    void loadHistory({ token: requestToken, setHistoryItems, setNextCursor, setHistoryLoading });
-  }, [requestToken]);
+  // ─── Handlers ─────────────────────────────────────────────────────────────
 
-  const sessionLabel = useMemo(
-    () => (isAuthenticated ? "Logged-in session" : "Anonymous session"),
-    [isAuthenticated]
-  );
+  const handleFileChange = (event) => {
+    const file = event.target.files?.[0];
+    if (file) void handleFileSelected(file);
+    event.target.value = "";
+  };
 
-  const processSelectedFile = async (file) => {
-    if (!file) return;
-
+  const handleFileSelected = async (file) => {
     setErrorMessage("");
-    setStatusMessage("");
 
-    if (file.size > MAX_FILE_SIZE_BYTES) {
-      setErrorMessage("File size exceeds 10MB.");
+    if (file.size > MAX_FILE_BYTES) {
+      setErrorMessage("File size exceeds 10 MB.");
       return;
     }
-
-    if (!isSupportedFile(file)) {
+    if (!isFileSupported(file)) {
       setErrorMessage("Only PDF, DOCX, or TXT files are supported.");
       return;
     }
 
-    setStage(STAGE_PROCESSING);
+    setStage("processing");
     setStatusMessage("Uploading resume...");
-    setImprovedHtml("");
     setGeneration(null);
+    setResumeHtml("");
 
     try {
-      const improveFormData = new FormData();
-      improveFormData.set("file", file, file.name || "resume.pdf");
-      improveFormData.set("theme", theme);
-      improveFormData.set("color", "#1e3a8a");
+      // Step 1 — Upload resume (§4.5)
+      const { payload: uploadPayload } = await uploadResume({
+        file,
+        token: requestToken,
+      });
+      const { resumeUploadId } = uploadPayload;
 
-      const headers = new Headers();
-      if (requestToken) {
-        const bearerValue = requestToken.startsWith("Bearer ")
-          ? requestToken
-          : `Bearer ${requestToken}`;
-        headers.set("authorization", bearerValue);
-      }
-      headers.set("idempotency-key", createClientIdempotencyKey("gen"));
-
+      // Step 2 — Generate portfolio (§4.7)
       setStatusMessage("Generating portfolio...");
+      const idempotencyKey = makeIdempotencyKey("gen");
 
-      const improveResponse = await fetch("/api/improve", {
-        method: "POST",
-        headers,
-        body: improveFormData,
-        credentials: "include",
+      const { payload: genPayload } = await createGeneration({
+        resumeUploadId,
+        theme,
+        color: DEFAULT_COLOR,
+        token: requestToken,
+        idempotencyKey,
       });
 
-      if (!improveResponse.ok) {
-        throw await createProxyError(improveResponse);
+      // Step 3 — Poll if PENDING (§3.1, §6.2)
+      let result = genPayload;
+      if (result.status === "PENDING" && result.generationId) {
+        setStatusMessage("Processing, please wait...");
+        result = (await pollUntilDone(result.generationId, requestToken)) ?? result;
       }
 
-      const improvePayload = await improveResponse.json();
-
-      let next = improvePayload;
-      if (next?.status === "PENDING" && next?.generationId) {
-        next = (await pollGeneration(next.generationId, requestToken)) || next;
-      }
-
-      await hydrateGeneration(next, requestToken, setGeneration, setImprovedHtml);
-      setStage(STAGE_RESULTS);
-      setStatusMessage(next?.status === "PENDING" ? "Still pending." : "");
+      // Step 4 — Hydrate and show results
+      await applyGeneration(result, requestToken, setGeneration, setResumeHtml);
+      setStage("results");
+      setStatusMessage("");
 
       if (requestToken) {
-        await loadHistory({ token: requestToken, setHistoryItems, setNextCursor, setHistoryLoading });
+        void loadHistory({ token: requestToken, setHistoryItems, setNextCursor, setHistoryLoading });
       }
-    } catch (error) {
-      setStage(STAGE_UPLOAD);
+    } catch (err) {
+      setStage("upload");
       setStatusMessage("");
-      setErrorMessage(getFriendlyErrorMessage(error, "Unable to process resume."));
+      setErrorMessage(friendlyError(err, "Failed to process resume."));
     }
   };
 
   const handleRetry = async () => {
     if (!generation?.generationId || retrying) return;
-
     setRetrying(true);
-    setStage(STAGE_PROCESSING);
+    setStage("processing");
     setStatusMessage("Retrying generation...");
     setErrorMessage("");
 
     try {
-      const retry = await retryGeneration({
+      const { payload } = await retryGeneration({
         generationId: generation.generationId,
         token: requestToken,
       });
 
-      let next = retry.payload;
-      if (next?.status === "PENDING" && next?.generationId) {
-        next = (await pollGeneration(next.generationId, requestToken)) || next;
+      let result = payload;
+      if (result.status === "PENDING" && result.generationId) {
+        setStatusMessage("Processing, please wait...");
+        result = (await pollUntilDone(result.generationId, requestToken)) ?? result;
       }
 
-      await hydrateGeneration(next, requestToken, setGeneration, setImprovedHtml);
-      setStage(STAGE_RESULTS);
+      await applyGeneration(result, requestToken, setGeneration, setResumeHtml);
+      setStage("results");
       setStatusMessage("");
-    } catch (error) {
-      setStage(STAGE_RESULTS);
+    } catch (err) {
+      setStage("results");
       setStatusMessage("");
-      setErrorMessage(getFriendlyErrorMessage(error, "Unable to retry generation."));
+      setErrorMessage(friendlyError(err, "Retry failed."));
     } finally {
       setRetrying(false);
     }
@@ -214,14 +240,14 @@ export default function WorkspacePage() {
     setResolvingSlug(slug);
     try {
       const { payload } = await resolvePublicPortfolio({ slug });
-      const portfolioUrl = payload?.hostedUrl || payload?.cloudinaryUrl || payload?.url;
-      if (portfolioUrl) {
-        window.open(portfolioUrl, "_blank", "noopener,noreferrer");
+      const url = payload?.url;
+      if (url) {
+        window.open(url, "_blank", "noopener,noreferrer");
       } else {
-        throw new Error("Portfolio URL not found");
+        setErrorMessage("Portfolio URL not found.");
       }
-    } catch (error) {
-      setErrorMessage(getFriendlyErrorMessage(error, "Unable to open portfolio URL."));
+    } catch (err) {
+      setErrorMessage(friendlyError(err, "Unable to open portfolio."));
     } finally {
       setResolvingSlug("");
     }
@@ -229,60 +255,108 @@ export default function WorkspacePage() {
 
   const handleLoadGeneration = async (generationId) => {
     if (!generationId) return;
-    setStage(STAGE_PROCESSING);
-    setStatusMessage("Loading generation...");
+    setStage("processing");
+    setStatusMessage("Loading...");
     setErrorMessage("");
+
     try {
       let { payload } = await getGeneration({ generationId, token: requestToken });
-      if (payload?.status === "PENDING") {
-        payload = (await pollGeneration(generationId, requestToken)) || payload;
+      if (payload.status === "PENDING") {
+        setStatusMessage("Still processing, polling...");
+        payload = (await pollUntilDone(generationId, requestToken)) ?? payload;
       }
-      await hydrateGeneration(payload, requestToken, setGeneration, setImprovedHtml);
-      setStage(STAGE_RESULTS);
+      await applyGeneration(payload, requestToken, setGeneration, setResumeHtml);
+      setStage("results");
       setStatusMessage("");
-    } catch (error) {
-      setStage(STAGE_RESULTS);
+    } catch (err) {
+      setStage("results");
       setStatusMessage("");
-      setErrorMessage(getFriendlyErrorMessage(error, "Unable to load generation."));
+      setErrorMessage(friendlyError(err, "Failed to load generation."));
     }
   };
 
-  const handleFileInputChange = (event) => {
-    const file = event.target.files?.[0];
-    void processSelectedFile(file);
-    event.target.value = "";
+  const handleSignOut = async () => {
+    await supabase.auth.signOut();
   };
+
+  const handleDownloadHtml = () => {
+    const blob = new Blob([editedHtml], { type: "text/html" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "resume.html";
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  // ─── Render ────────────────────────────────────────────────────────────────
 
   return (
     <MinimalLayout>
       <main className="min-h-screen py-8 sm:py-10">
         <section className="w-full max-w-[820px]">
-          <div className="mb-2 flex items-center justify-between gap-3">
-            <p className="text-xs font-medium uppercase tracking-[0.08em] text-[#555555]">Resume</p>
-            <p className="text-xs text-[#555555]">{sessionLabel}</p>
+
+          {/* Header row */}
+          <div className="mb-4 flex items-center justify-between gap-3">
+            <p className="text-xs font-medium uppercase tracking-[0.08em] text-[#555555]">
+              Resume
+            </p>
+            <div className="flex items-center gap-3">
+              {isAuthenticated ? (
+                <>
+                  <span className="text-xs text-[#555555]">{user?.email}</span>
+                  <button
+                    type="button"
+                    onClick={handleSignOut}
+                    className={`rounded-md border border-[#E5E5E5] px-3 py-1 text-xs text-[#111111] transition-colors hover:bg-[#EFEFEB] ${focusRing}`}
+                  >
+                    Sign out
+                  </button>
+                </>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setShowAuthModal(true)}
+                  className={`rounded-md border border-[#E5E5E5] px-3 py-1 text-xs text-[#111111] transition-colors hover:bg-[#EFEFEB] ${focusRing}`}
+                >
+                  Sign in
+                </button>
+              )}
+            </div>
           </div>
 
-          <div className="mt-3 border-t border-[#E5E5E5] pt-5">
-            {stage !== STAGE_RESULTS ? (
+          <div className="border-t border-[#E5E5E5] pt-5">
+            {stage === "upload" && (
               <UploadSection
                 fileInputRef={fileInputRef}
-                stage={stage}
-                statusMessage={statusMessage}
                 errorMessage={errorMessage}
-                onFileInputChange={handleFileInputChange}
-                onSelectFile={() => fileInputRef.current?.click()}
+                onChoose={() => fileInputRef.current?.click()}
+                onFileChange={handleFileChange}
               />
-            ) : (
+            )}
+
+            {stage === "processing" && (
+              <ProcessingSection statusMessage={statusMessage} />
+            )}
+
+            {stage === "results" && (
               <ResultsSection
                 activeTab={activeTab}
+                editedHtml={editedHtml}
+                errorMessage={errorMessage}
                 generation={generation}
-                improvedHtml={improvedHtml}
+                historyItems={historyItems}
+                historyLoading={historyLoading}
                 isAuthenticated={isAuthenticated}
-                isResolvingPortfolio={Boolean(resolvingSlug)}
                 isRetrying={retrying}
                 nextCursor={nextCursor}
+                resolvingSlug={resolvingSlug}
+                theme={theme}
+                themeOptions={themeOptions}
+                onDownloadHtml={handleDownloadHtml}
+                onEditHtml={setEditedHtml}
                 onLoadGeneration={handleLoadGeneration}
-                onLoadMoreHistory={() =>
+                onLoadMore={() =>
                   loadHistory({
                     token: requestToken,
                     cursor: nextCursor,
@@ -296,20 +370,16 @@ export default function WorkspacePage() {
                 onOpenSignIn={() => setShowAuthModal(true)}
                 onRetry={handleRetry}
                 onTabChange={setActiveTab}
-                setTheme={setTheme}
-                theme={theme}
-                themeOptions={themeOptions}
-                historyItems={historyItems}
-                historyLoading={historyLoading}
-                hasPortfolioSlug={hasPortfolioSlug}
-                statusMessage={statusMessage}
+                onThemeChange={setTheme}
+                onUploadAnother={() => {
+                  setStage("upload");
+                  setErrorMessage("");
+                  setGeneration(null);
+                  setResumeHtml("");
+                }}
               />
             )}
           </div>
-
-          {stage === STAGE_RESULTS && errorMessage && (
-            <p className="mt-3 text-xs text-[#555555]">{errorMessage}</p>
-          )}
         </section>
       </main>
 
@@ -318,175 +388,196 @@ export default function WorkspacePage() {
         onClose={() => setShowAuthModal(false)}
         variant="signin"
         onContinueGuest={() => setShowAuthModal(false)}
-        onSignIn={() => {}}
       />
     </MinimalLayout>
   );
 }
 
-function UploadSection({
-  fileInputRef,
-  stage,
-  statusMessage,
-  errorMessage,
-  onFileInputChange,
-  onSelectFile,
-}) {
+// ─── Section components ────────────────────────────────────────────────────
+
+function UploadSection({ fileInputRef, errorMessage, onChoose, onFileChange }) {
   return (
     <div>
       <p className="text-xs font-medium uppercase tracking-[0.08em] text-[#555555]">Upload</p>
-      <div className="mt-3 border border-dashed border-[#D7D0BD] bg-[#EFE7CF] px-5 py-8">
-        {stage === STAGE_UPLOAD ? (
-          <>
-            <p className="text-base font-medium text-[#111111]">Upload your resume</p>
-            <p className="mt-1 text-sm text-[#555555]">PDF, DOCX, or TXT • Max 10MB</p>
-            <button
-              type="button"
-              onClick={onSelectFile}
-              className={`mt-4 inline-flex items-center border border-[#CFC7B2] bg-[#F1E9D2] px-3 py-2 text-sm font-medium text-[#111111] transition-colors hover:bg-[#EBE1C5] ${focusRing}`}
-            >
-              Choose file
-            </button>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept=".pdf,.docx,.txt,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain"
-              onChange={onFileInputChange}
-              className="sr-only"
-            />
-          </>
-        ) : (
-          <p className="inline-flex items-center gap-1 text-sm text-[#555555]">
-            <span>{statusMessage || "Processing"}</span>
-            <AnimatedDots />
-          </p>
-        )}
+      <div className="mt-3 border border-dashed border-[#D7D0BD] bg-[#EFE7CF] px-5 py-10">
+        <p className="text-base font-medium text-[#111111]">Upload your resume</p>
+        <p className="mt-1 text-sm text-[#555555]">PDF, DOCX, or TXT · Max 10 MB</p>
+        <button
+          type="button"
+          onClick={onChoose}
+          className={`mt-4 inline-flex items-center border border-[#CFC7B2] bg-[#F1E9D2] px-3 py-2 text-sm font-medium text-[#111111] transition-colors hover:bg-[#EBE1C5] ${focusRing}`}
+        >
+          Choose file
+        </button>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".pdf,.docx,.txt,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain"
+          onChange={onFileChange}
+          className="sr-only"
+        />
       </div>
-      {errorMessage && <p className="mt-2 text-xs text-[#555555]">{errorMessage}</p>}
+      {errorMessage && (
+        <p className="mt-2 text-xs text-[#555555]">{errorMessage}</p>
+      )}
+    </div>
+  );
+}
+
+function ProcessingSection({ statusMessage }) {
+  return (
+    <div className="border border-dashed border-[#D7D0BD] bg-[#EFE7CF] px-5 py-10">
+      <p className="inline-flex items-center gap-1 text-sm text-[#555555]">
+        <span>{statusMessage || "Processing"}</span>
+        <Dots />
+      </p>
     </div>
   );
 }
 
 function ResultsSection({
   activeTab,
+  editedHtml,
+  errorMessage,
   generation,
-  improvedHtml,
+  historyItems,
+  historyLoading,
   isAuthenticated,
-  isResolvingPortfolio,
   isRetrying,
   nextCursor,
+  resolvingSlug,
+  theme,
+  themeOptions,
+  onDownloadHtml,
+  onEditHtml,
   onLoadGeneration,
-  onLoadMoreHistory,
+  onLoadMore,
   onOpenPortfolio,
   onOpenSignIn,
   onRetry,
   onTabChange,
-  setTheme,
-  theme,
-  themeOptions,
-  historyItems,
-  historyLoading,
-  hasPortfolioSlug,
-  statusMessage,
+  onThemeChange,
+  onUploadAnother,
 }) {
-  const [editedHtml, setEditedHtml] = useState(improvedHtml);
-
-  useEffect(() => {
-    setEditedHtml(improvedHtml);
-  }, [improvedHtml]);
-
-  const exportHtml = () => {
-    const blob = new Blob([editedHtml], { type: "text/html" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = "resume.html";
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    URL.revokeObjectURL(url);
-  };
+  const hasSlug = Boolean(generation?.portfolio?.slug);
 
   return (
     <div>
+      {/* Tabs */}
       <div className="border-b border-[#E5E5E5]">
         <div className="-mb-px flex items-end gap-6">
-          <TabButton isActive={activeTab === TAB_RESUME_EDITOR} onClick={() => onTabChange(TAB_RESUME_EDITOR)}>
+          <TabButton active={activeTab === "resume"} onClick={() => onTabChange("resume")}>
             Resume Editor
           </TabButton>
-          <TabButton
-            isActive={activeTab === TAB_PORTFOLIO_BUILDER}
-            onClick={() => onTabChange(TAB_PORTFOLIO_BUILDER)}
-          >
+          <TabButton active={activeTab === "portfolio"} onClick={() => onTabChange("portfolio")}>
             Portfolio Builder
           </TabButton>
         </div>
       </div>
 
-      <div className="mx-auto mt-6 max-w-[820px] border border-[#E5E5E5] bg-white px-8 py-10">
-        {activeTab === TAB_RESUME_EDITOR ? (
+      {/* Tab panels */}
+      <div className="mt-6 border border-[#E5E5E5] bg-white px-8 py-10">
+        {activeTab === "resume" ? (
           <>
             <div
               contentEditable
               suppressContentEditableWarning
               dangerouslySetInnerHTML={{ __html: editedHtml }}
-              onInput={(event) => setEditedHtml(event.currentTarget.innerHTML)}
+              onInput={(e) => onEditHtml(e.currentTarget.innerHTML)}
               className={`min-h-[260px] text-[#111111] focus-visible:outline-none ${focusRing}`}
             />
-            <button
-              type="button"
-              onClick={exportHtml}
-              className={`mt-6 inline-flex items-center rounded-md bg-[#1E3A8A] px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-[#1C347C] ${focusRing}`}
-            >
-              Download HTML
-            </button>
-          </>
-        ) : (
-          <>
-            <fieldset className="space-y-2">
-              <legend className="text-xs font-medium uppercase tracking-[0.08em] text-[#555555]">Theme</legend>
-              {themeOptions.map((item) => (
-                <label key={item.id} className="flex items-center gap-2 text-sm text-[#111111]">
-                  <input
-                    checked={theme === item.id}
-                    className={focusRing}
-                    name="theme"
-                    onChange={() => setTheme(item.id)}
-                    type="radio"
-                    value={item.id}
-                  />
-                  <span>{item.name}</span>
-                </label>
-              ))}
-            </fieldset>
             <div className="mt-6 flex flex-wrap gap-2">
               <button
                 type="button"
-                disabled={!hasPortfolioSlug || isResolvingPortfolio}
+                onClick={onDownloadHtml}
+                className={`inline-flex items-center rounded-md bg-[#1E3A8A] px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-[#1C347C] ${focusRing}`}
+              >
+                Download HTML
+              </button>
+              <button
+                type="button"
+                onClick={onUploadAnother}
+                className={`inline-flex items-center rounded-md border border-[#E5E5E5] px-4 py-2 text-sm text-[#111111] transition-colors hover:bg-[#F7F4EC] ${focusRing}`}
+              >
+                Upload another
+              </button>
+            </div>
+          </>
+        ) : (
+          <>
+            {themeOptions.length > 0 && (
+              <fieldset className="mb-6 space-y-2">
+                <legend className="text-xs font-medium uppercase tracking-[0.08em] text-[#555555]">
+                  Theme
+                </legend>
+                {themeOptions.map((t) => (
+                  <label key={t.id} className="flex items-center gap-2 text-sm text-[#111111]">
+                    <input
+                      checked={theme === t.id}
+                      name="theme"
+                      onChange={() => onThemeChange(t.id)}
+                      type="radio"
+                      value={t.id}
+                      className={focusRing}
+                    />
+                    <span>{t.name}</span>
+                    {t.description && (
+                      <span className="text-xs text-[#555555]">— {t.description}</span>
+                    )}
+                  </label>
+                ))}
+              </fieldset>
+            )}
+
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                disabled={!hasSlug || Boolean(resolvingSlug)}
                 onClick={() => onOpenPortfolio(generation?.portfolio?.slug)}
                 className={`inline-flex items-center rounded-md bg-[#1E3A8A] px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-[#1C347C] disabled:cursor-not-allowed disabled:opacity-60 ${focusRing}`}
               >
-                {isResolvingPortfolio ? "Resolving..." : "Open Live Portfolio"}
+                {resolvingSlug ? "Resolving..." : "Open Live Portfolio"}
               </button>
+
               {generation?.status === "FAILED" && (
                 <button
                   type="button"
                   disabled={isRetrying}
                   onClick={onRetry}
-                  className={`inline-flex items-center rounded-md border border-[#E5E5E5] px-4 py-2 text-sm text-[#111111] transition-colors hover:bg-[#F7F4EC] ${focusRing}`}
+                  className={`inline-flex items-center rounded-md border border-[#E5E5E5] px-4 py-2 text-sm text-[#111111] transition-colors hover:bg-[#F7F4EC] disabled:opacity-60 ${focusRing}`}
                 >
                   {isRetrying ? "Retrying..." : "Retry"}
                 </button>
               )}
+
+              <button
+                type="button"
+                onClick={onUploadAnother}
+                className={`inline-flex items-center rounded-md border border-[#E5E5E5] px-4 py-2 text-sm text-[#111111] transition-colors hover:bg-[#F7F4EC] ${focusRing}`}
+              >
+                Upload another
+              </button>
             </div>
-            {statusMessage && <p className="mt-3 text-xs text-[#555555]">{statusMessage}</p>}
+
+            {generation?.portfolio?.slug && (
+              <p className="mt-3 text-xs text-[#555555]">
+                Slug: <span className="font-mono">{generation.portfolio.slug}</span>
+              </p>
+            )}
+
+            {errorMessage && (
+              <p className="mt-3 text-xs text-[#555555]">{errorMessage}</p>
+            )}
           </>
         )}
       </div>
 
-      <div className="mx-auto mt-6 max-w-[820px] border border-[#E5E5E5] bg-white px-6 py-6">
+      {/* Generation history */}
+      <div className="mt-6 border border-[#E5E5E5] bg-white px-6 py-6">
         <div className="mb-3 flex items-center justify-between gap-2">
-          <p className="text-xs font-medium uppercase tracking-[0.08em] text-[#555555]">Generation History</p>
+          <p className="text-xs font-medium uppercase tracking-[0.08em] text-[#555555]">
+            Generation History
+          </p>
           {!isAuthenticated && (
             <button
               type="button"
@@ -497,12 +588,19 @@ function ResultsSection({
             </button>
           )}
         </div>
+
         {isAuthenticated ? (
           <>
+            {historyItems.length === 0 && !historyLoading && (
+              <p className="text-xs text-[#555555]">No generations yet.</p>
+            )}
             {historyItems.map((item) => (
               <div key={item.generationId} className="mb-2 border border-[#E5E5E5] px-3 py-2">
                 <p className="text-xs text-[#555555]">
-                  {item.status} • {item.createdAt ? new Date(item.createdAt).toLocaleString() : "Unknown date"}
+                  <span className="font-medium">{item.status}</span>
+                  {item.createdAt && (
+                    <> · {new Date(item.createdAt).toLocaleString()}</>
+                  )}
                 </p>
                 <div className="mt-2 flex flex-wrap gap-2">
                   <button
@@ -524,32 +622,34 @@ function ResultsSection({
                 </div>
               </div>
             ))}
-            {historyLoading && <p className="text-xs text-[#555555]">Loading history...</p>}
+            {historyLoading && (
+              <p className="text-xs text-[#555555]">Loading history...</p>
+            )}
             {nextCursor && !historyLoading && (
               <button
                 type="button"
-                onClick={onLoadMoreHistory}
+                onClick={onLoadMore}
                 className={`mt-2 inline-flex items-center rounded-md border border-[#E5E5E5] px-3 py-1.5 text-xs text-[#111111] transition-colors hover:bg-[#F7F4EC] ${focusRing}`}
               >
-                Load More
+                Load more
               </button>
             )}
           </>
         ) : (
-          <p className="text-xs text-[#555555]">`GET /v1/generations` requires a bearer token.</p>
+          <p className="text-xs text-[#555555]">Sign in to view your generation history.</p>
         )}
       </div>
     </div>
   );
 }
 
-function TabButton({ children, isActive, onClick }) {
+function TabButton({ active, onClick, children }) {
   return (
     <button
       type="button"
       onClick={onClick}
       className={`border-b-2 px-0 py-2 text-sm font-medium transition-colors ${focusRing} ${
-        isActive
+        active
           ? "border-[#1E3A8A] text-[#111111]"
           : "border-transparent text-[#555555] hover:text-[#111111]"
       }`}
@@ -559,71 +659,63 @@ function TabButton({ children, isActive, onClick }) {
   );
 }
 
-function AnimatedDots() {
+function Dots() {
   return (
-    <span className="inline-flex items-center text-[#555555]">
-      <span className="workspace-dot">.</span>
-      <span className="workspace-dot workspace-dot-delay-1">.</span>
-      <span className="workspace-dot workspace-dot-delay-2">.</span>
+    <span className="inline-flex items-center gap-px text-[#555555]">
+      {[0, 200, 400].map((delay) => (
+        <span
+          key={delay}
+          style={{ animationDelay: `${delay}ms` }}
+          className="animate-[dotFade_1.2s_infinite]"
+        >
+          .
+        </span>
+      ))}
       <style jsx>{`
-        .workspace-dot {
-          opacity: 0.15;
-          animation: workspace-dot-fade 1.2s infinite;
-        }
-        .workspace-dot-delay-1 {
-          animation-delay: 0.2s;
-        }
-        .workspace-dot-delay-2 {
-          animation-delay: 0.4s;
-        }
-        @keyframes workspace-dot-fade {
-          0%,
-          80%,
-          100% {
-            opacity: 0.15;
-          }
-          40% {
-            opacity: 1;
-          }
+        @keyframes dotFade {
+          0%, 80%, 100% { opacity: 0.15; }
+          40% { opacity: 1; }
         }
       `}</style>
     </span>
   );
 }
 
-async function hydrateGeneration(payload, token, setGeneration, setImprovedHtml) {
-  let next = payload;
-  if (next?.generationId && !next?.createdAt) {
-    try {
-      const detail = await getGeneration({ generationId: next.generationId, token });
-      next = { ...next, ...detail.payload };
-    } catch {}
-  }
-  setGeneration(next || null);
+// ─── Async helpers ─────────────────────────────────────────────────────────
 
-  if (next?.resume?.htmlUrl) {
-    try {
-      const response = await fetch(next.resume.htmlUrl, { cache: "no-store" });
-      if (!response.ok) throw new Error("Resume preview load failed");
-      setImprovedHtml(await response.text());
-    } catch {
-      setImprovedHtml("");
-    }
+async function pollUntilDone(generationId, token) {
+  const deadline = Date.now() + POLL_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    await sleep(POLL_INTERVAL_MS);
+    const { payload } = await getGenerationStatus({ generationId, token });
+    if (payload?.status && payload.status !== "PENDING") return payload;
   }
+  return null; // timed out
 }
 
-async function pollGeneration(generationId, token) {
-  const started = Date.now();
-  let latest = null;
-  while (Date.now() - started < POLL_TIMEOUT_MS) {
-    await sleep(POLL_INTERVAL_MS);
-    const result = await getGenerationStatus({ generationId, token });
-    latest = result.payload;
-    if (latest?.status && latest.status !== "PENDING") {
-      return latest;
+async function applyGeneration(payload, token, setGeneration, setResumeHtml) {
+  // Fetch full details if createdAt is missing (e.g. came from generate/retry)
+  let gen = payload;
+  if (gen?.generationId && !gen?.createdAt) {
+    try {
+      const { payload: detail } = await getGeneration({ generationId: gen.generationId, token });
+      gen = { ...gen, ...detail };
+    } catch {
+      // non-fatal — use what we have
     }
   }
-  return latest;
+  setGeneration(gen ?? null);
+
+  // Fetch HTML content for resume editor
+  if (gen?.resume?.htmlUrl) {
+    try {
+      const res = await fetch(gen.resume.htmlUrl, { cache: "no-store" });
+      if (!res.ok) throw new Error("Failed to fetch resume HTML");
+      setResumeHtml(await res.text());
+    } catch {
+      setResumeHtml("");
+    }
+  }
 }
 
 async function loadHistory({
@@ -637,77 +729,44 @@ async function loadHistory({
   if (!token) return;
   setHistoryLoading(true);
   try {
-    const result = await listGenerations({
-      token,
-      limit: 20,
-      cursor,
-    });
-    const items = Array.isArray(result?.payload?.items) ? result.payload.items : [];
+    const { payload } = await listGenerations({ token, limit: 20, cursor });
+    const items = Array.isArray(payload?.items) ? payload.items : [];
     setHistoryItems((prev) => (append ? [...prev, ...items] : items));
-    setNextCursor(result?.payload?.nextCursor || "");
+    setNextCursor(payload?.nextCursor ?? null);
+  } catch {
+    // history load failure is non-fatal
   } finally {
     setHistoryLoading(false);
   }
 }
 
-function isSupportedFile(file) {
-  const fileName = file.name?.toLowerCase() ?? "";
-  const extension = fileName.includes(".") ? fileName.split(".").pop() : "";
-  return ACCEPTED_MIME_TYPES.has(file.type) || ACCEPTED_EXTENSIONS.has(extension);
+function isFileSupported(file) {
+  const ext = file.name?.toLowerCase().split(".").pop() ?? "";
+  return ACCEPTED_MIME.has(file.type) || ACCEPTED_EXT.has(ext);
 }
 
 function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  return new Promise((r) => setTimeout(r, ms));
 }
 
-function createClientIdempotencyKey(prefix = "gen") {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-    return `${prefix}-${crypto.randomUUID()}`;
-  }
-
-  const random = Math.random().toString(36).slice(2, 10);
-  return `${prefix}-${Date.now()}-${random}`;
-}
-
-async function createProxyError(response) {
-  let message = `Request failed with status ${response.status}`;
-
-  try {
-    const payload = await response.json();
-    const backendMessage = payload?.error?.message;
-    const requestId = payload?.error?.requestId || response.headers.get("x-request-id");
-    if (backendMessage) {
-      message = backendMessage;
-    }
-    if (requestId) {
-      message = `${message} (Request ID: ${requestId})`;
-    }
-  } catch {
-    const text = await response.text().catch(() => "");
-    if (text) {
-      message = text;
-    }
-  }
-
-  return new Error(message);
-}
-
-function getFriendlyErrorMessage(error, fallbackMessage) {
-  if (error instanceof ApiError) {
-    const requestIdSuffix = error.requestId ? ` (Request ID: ${error.requestId})` : "";
-    switch (error.code) {
+// Maps ApiError codes to user-facing messages (§6.4 of plan)
+function friendlyError(err, fallback) {
+  if (err instanceof ApiError) {
+    const suffix = err.requestId ? ` (ID: ${err.requestId})` : "";
+    switch (err.code) {
       case "FILE_TOO_LARGE":
-        return `File size exceeds 10MB.${requestIdSuffix}`;
+        return `File exceeds 10 MB.${suffix}`;
       case "UNSUPPORTED_FILE_TYPE":
-        return `Only PDF, DOCX, or TXT files are supported.${requestIdSuffix}`;
+        return `Only PDF, DOCX, or TXT files are supported.${suffix}`;
       case "GENERATE_COOLDOWN":
-        return `Please wait 5 seconds before generating again.${requestIdSuffix}`;
+        return `Please wait 5 seconds before generating again.${suffix}`;
       case "QUOTA_EXCEEDED":
-        return `Daily quota reached. Please try again tomorrow.${requestIdSuffix}`;
+        return `Daily quota reached. Try again tomorrow.${suffix}`;
+      case "RESUME_NOT_FOUND":
+        return `Resume upload not found. Please upload again.${suffix}`;
       default:
-        return `${error.message || fallbackMessage}${requestIdSuffix}`;
+        return `${err.message || fallback}${suffix}`;
     }
   }
-  if (error instanceof Error && error.message) return error.message;
-  return fallbackMessage;
+  return err instanceof Error ? err.message : fallback;
 }

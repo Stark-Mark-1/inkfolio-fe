@@ -4,7 +4,30 @@ import { useEffect, useRef } from "react";
 import Link from "next/link";
 import GoogleButton from "./GoogleButton";
 import OTPForm from "./OTPForm";
+import { supabase } from "@/lib/supabase";
 import { focusRing } from "@/lib/ui";
+
+async function sendOtp(email) {
+  const { error } = await supabase.auth.signInWithOtp({ email });
+  if (error) throw new Error(error.message);
+}
+
+async function verifyOtp({ email, otp }) {
+  const { error } = await supabase.auth.verifyOtp({
+    email,
+    token: otp,
+    type: "email",
+  });
+  if (error) throw new Error(error.message);
+}
+
+async function signInWithGoogle() {
+  const { error } = await supabase.auth.signInWithOAuth({
+    provider: "google",
+    options: { redirectTo: `${window.location.origin}/workspace` },
+  });
+  if (error) throw new Error(error.message);
+}
 
 export default function AuthModal({
   open,
@@ -17,18 +40,13 @@ export default function AuthModal({
 
   useEffect(() => {
     if (!open) return undefined;
-
     closeRef.current?.focus();
-    const previousOverflow = document.body.style.overflow;
+    const prev = document.body.style.overflow;
     document.body.style.overflow = "hidden";
-
-    const onKeyDown = (event) => {
-      if (event.key === "Escape") onClose?.();
-    };
-
+    const onKeyDown = (e) => { if (e.key === "Escape") onClose?.(); };
     window.addEventListener("keydown", onKeyDown);
     return () => {
-      document.body.style.overflow = previousOverflow;
+      document.body.style.overflow = prev;
       window.removeEventListener("keydown", onKeyDown);
     };
   }, [open, onClose]);
@@ -90,14 +108,14 @@ export default function AuthModal({
             <p className="text-sm text-[#555555]">
               Use email OTP or your Google account to continue.
             </p>
-            <OTPForm />
+            <OTPForm onSendCode={sendOtp} onVerify={verifyOtp} onSuccess={onClose} />
             <div className="relative py-1">
               <div className="border-t border-[#E5E5E5]" />
               <span className="absolute left-1/2 top-0 -translate-x-1/2 bg-[#F1E9D2] px-2 text-xs text-[#555555]">
                 or
               </span>
             </div>
-            <GoogleButton />
+            <GoogleButton onClick={signInWithGoogle} />
             <p className="text-sm text-[#555555]">
               Prefer full page?{" "}
               <Link href="/auth/signin" className="text-[#1E3A8A] underline-offset-2 hover:underline">
