@@ -87,16 +87,18 @@ Behavior notes:
 Set backend URL in Vercel for reliable routing:
 
 ```env
+NEXT_PUBLIC_BASE_URL=https://your-backend-domain
 BACKEND_URL=https://your-backend-domain
 NEXT_PUBLIC_BACKEND_URL=https://your-backend-domain
 ```
 
 Resolution order:
 
-1. `BACKEND_URL` (server routes like `/api/improve`)
-2. `NEXT_PUBLIC_BACKEND_URL` (browser + server fallback)
-3. `NEXT_PUBLIC_API_BASE_URL` (legacy fallback)
-4. default `http://localhost:3001`
+1. `NEXT_PUBLIC_BASE_URL` (recommended)
+2. `BACKEND_URL` (server routes like `/api/improve`)
+3. `NEXT_PUBLIC_BACKEND_URL` (browser + server fallback)
+4. `NEXT_PUBLIC_API_BASE_URL` (legacy fallback)
+5. default `http://localhost:3001`
 
 ## Project Structure
 
