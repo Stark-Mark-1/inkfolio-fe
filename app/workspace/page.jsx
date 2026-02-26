@@ -160,7 +160,7 @@ export default function WorkspacePage() {
       const improvePayload = await improveResponse.json();
 
       let next = improvePayload;
-      if (next?.status === "PENDING" && next?.generationId && requestToken) {
+      if (next?.status === "PENDING" && next?.generationId) {
         next = (await pollGeneration(next.generationId, requestToken)) || next;
       }
 
@@ -214,8 +214,9 @@ export default function WorkspacePage() {
     setResolvingSlug(slug);
     try {
       const { payload } = await resolvePublicPortfolio({ slug });
-      if (payload?.url) {
-        window.open(payload.url, "_blank", "noopener,noreferrer");
+      const portfolioUrl = payload?.hostedUrl || payload?.cloudinaryUrl || payload?.url;
+      if (portfolioUrl) {
+        window.open(portfolioUrl, "_blank", "noopener,noreferrer");
       } else {
         throw new Error("Portfolio URL not found");
       }
