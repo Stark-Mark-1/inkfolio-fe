@@ -1,39 +1,41 @@
 "use client";
 
 import { useEffect, useRef } from "react";
-import Link from "next/link";
+import {
+  GoogleAuthProvider,
+  signInWithPopup,
+  signInWithEmailAndPassword,
+  createUserWithEmailAndPassword,
+} from "firebase/auth";
+import { auth } from "@/lib/firebase";
 import GoogleButton from "./GoogleButton";
 import OTPForm from "./OTPForm";
-import { supabase } from "@/lib/supabase";
 import { focusRing } from "@/lib/ui";
 
-async function sendOtp(email) {
-  const { error } = await supabase.auth.signInWithOtp({ email });
-  if (error) throw new Error(error.message);
-}
-
-async function verifyOtp({ email, otp }) {
-  const { error } = await supabase.auth.verifyOtp({
-    email,
-    token: otp,
-    type: "email",
-  });
-  if (error) throw new Error(error.message);
-}
-
 async function signInWithGoogle() {
-  const { error } = await supabase.auth.signInWithOAuth({
-    provider: "google",
-    options: { redirectTo: `${window.location.origin}/workspace` },
-  });
-  if (error) throw new Error(error.message);
+  const provider = new GoogleAuthProvider();
+  await signInWithPopup(auth, provider);
 }
 
+async function signInWithEmail(email, password) {
+  await signInWithEmailAndPassword(auth, email, password);
+}
+
+async function registerWithEmail(email, password) {
+  await createUserWithEmailAndPassword(auth, email, password);
+}
+
+// variant: "signin" | "nudge" | "predeploy"
+//
+// "nudge"    — shown after file upload, skippable
+// "signin"   — standard sign-in modal
+// "predeploy"— shown before deploying (legacy, kept for compat)
 export default function AuthModal({
   open,
   onClose,
   variant = "signin",
   onContinueGuest,
+  onSignInSuccess,
   onSignIn,
 }) {
   const closeRef = useRef(null);
@@ -43,7 +45,9 @@ export default function AuthModal({
     closeRef.current?.focus();
     const prev = document.body.style.overflow;
     document.body.style.overflow = "hidden";
-    const onKeyDown = (e) => { if (e.key === "Escape") onClose?.(); };
+    const onKeyDown = (e) => {
+      if (e.key === "Escape") onClose?.();
+    };
     window.addEventListener("keydown", onKeyDown);
     return () => {
       document.body.style.overflow = prev;
@@ -53,22 +57,38 @@ export default function AuthModal({
 
   if (!open) return null;
 
+  const handleSuccess = () => {
+    onSignInSuccess?.();
+    onClose?.();
+  };
+
+  const handleGoogleSignIn = async () => {
+    await signInWithGoogle();
+    handleSuccess();
+  };
+
+  const isNudge = variant === "nudge";
   const isPreDeploy = variant === "predeploy";
+
+  const title = isNudge
+    ? "Sign in to save your work"
+    : isPreDeploy
+    ? "Before you deploy"
+    : "Sign in";
+
+  const titleId = isNudge ? "auth-nudge-title" : isPreDeploy ? "auth-predeploy-title" : "auth-modal-title";
 
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/15 p-4"
       role="dialog"
       aria-modal="true"
-      aria-labelledby={isPreDeploy ? "auth-nudge-title" : "auth-modal-title"}
+      aria-labelledby={titleId}
     >
       <div className="w-full max-w-md rounded-lg border border-[#E5E5E5] bg-[#F1E9D2] p-6">
         <div className="mb-5 flex items-start justify-between gap-4">
-          <h2
-            id={isPreDeploy ? "auth-nudge-title" : "auth-modal-title"}
-            className="text-lg font-semibold text-[#111111]"
-          >
-            {isPreDeploy ? "Before you deploy" : "Sign in"}
+          <h2 id={titleId} className="text-lg font-semibold text-[#111111]">
+            {title}
           </h2>
           <button
             ref={closeRef}
@@ -105,23 +125,36 @@ export default function AuthModal({
           </div>
         ) : (
           <div className="space-y-4">
-            <p className="text-sm text-[#555555]">
-              Use email OTP or your Google account to continue.
-            </p>
-            <OTPForm onSendCode={sendOtp} onVerify={verifyOtp} onSuccess={onClose} />
+            {isNudge && (
+              <p className="text-sm text-[#555555]">
+                Sign in to save your portfolio and access it later. You can also skip and continue anonymously.
+              </p>
+            )}
+
+            <GoogleButton onClick={handleGoogleSignIn} />
+
             <div className="relative py-1">
               <div className="border-t border-[#E5E5E5]" />
-              <span className="absolute left-1/2 top-0 -translate-x-1/2 bg-[#F1E9D2] px-2 text-xs text-[#555555]">
+              <span className="absolute left-1/2 top-0 -translate-x-1/2 -translate-y-1/2 bg-[#F1E9D2] px-2 text-xs text-[#555555]">
                 or
               </span>
             </div>
-            <GoogleButton onClick={signInWithGoogle} />
-            <p className="text-sm text-[#555555]">
-              Prefer full page?{" "}
-              <Link href="/auth/signin" className="text-[#1E3A8A] underline-offset-2 hover:underline">
-                Open sign in page
-              </Link>
-            </p>
+
+            <OTPForm
+              onSignIn={signInWithEmail}
+              onRegister={registerWithEmail}
+              onSuccess={handleSuccess}
+            />
+
+            {isNudge && (
+              <button
+                type="button"
+                onClick={onContinueGuest}
+                className={`w-full rounded-md border border-[#E5E5E5] px-4 py-2.5 text-sm font-medium text-[#111111] transition-colors hover:bg-[#EFEFEB] ${focusRing}`}
+              >
+                Continue without signing in
+              </button>
+            )}
           </div>
         )}
       </div>

@@ -2,36 +2,27 @@
 
 import { useRouter } from "next/navigation";
 import Link from "next/link";
+import {
+  GoogleAuthProvider,
+  signInWithPopup,
+  signInWithEmailAndPassword,
+  createUserWithEmailAndPassword,
+} from "firebase/auth";
+import { auth } from "@/lib/firebase";
 import GoogleButton from "@/components/GoogleButton";
 import MinimalLayout from "@/components/MinimalLayout";
 import OTPForm from "@/components/OTPForm";
-import { supabase } from "@/lib/supabase";
 import { focusRing } from "@/lib/ui";
 
-async function sendOtp(email) {
-  const { error } = await supabase.auth.signInWithOtp({ email });
-  if (error) throw new Error(error.message);
-}
-
-async function verifyOtp({ email, otp }) {
-  const { error } = await supabase.auth.verifyOtp({
-    email,
-    token: otp,
-    type: "email",
-  });
-  if (error) throw new Error(error.message);
-}
-
 async function signInWithGoogle() {
-  const { error } = await supabase.auth.signInWithOAuth({
-    provider: "google",
-    options: { redirectTo: `${window.location.origin}/workspace` },
-  });
-  if (error) throw new Error(error.message);
+  const provider = new GoogleAuthProvider();
+  await signInWithPopup(auth, provider);
 }
 
 export default function SignInPage() {
   const router = useRouter();
+
+  const handleSuccess = () => router.push("/workspace");
 
   return (
     <MinimalLayout>
@@ -40,23 +31,32 @@ export default function SignInPage() {
           <div className="mb-6">
             <h1 className="text-2xl font-semibold tracking-tight text-[#111111]">Sign in</h1>
             <p className="mt-2 text-sm text-[#555555]">
-              Use email OTP or Google to access your saved work.
+              Use email or Google to access your saved work.
             </p>
           </div>
 
           <div className="space-y-4">
-            <OTPForm
-              onSendCode={sendOtp}
-              onVerify={verifyOtp}
-              onSuccess={() => router.push("/workspace")}
+            <GoogleButton
+              onClick={async () => {
+                await signInWithGoogle();
+                handleSuccess();
+              }}
             />
             <div className="relative py-1">
               <div className="border-t border-[#E5E5E5]" />
-              <span className="absolute left-1/2 top-0 -translate-x-1/2 bg-[#F1E9D2] px-2 text-xs text-[#555555]">
+              <span className="absolute left-1/2 top-0 -translate-x-1/2 -translate-y-1/2 bg-[#F1E9D2] px-2 text-xs text-[#555555]">
                 or
               </span>
             </div>
-            <GoogleButton onClick={signInWithGoogle} />
+            <OTPForm
+              onSignIn={(email, password) =>
+                signInWithEmailAndPassword(auth, email, password)
+              }
+              onRegister={(email, password) =>
+                createUserWithEmailAndPassword(auth, email, password)
+              }
+              onSuccess={handleSuccess}
+            />
           </div>
 
           <div className="mt-6 border-t border-[#E5E5E5] pt-4">
